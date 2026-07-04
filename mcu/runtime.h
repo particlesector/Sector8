@@ -24,6 +24,10 @@ public:
 
     // Load and execute a cart's top-level chunk (defines _init/_update/_draw).
     bool loadCartSource(const char* path);
+    // Load a packed .s8 cart: push its assets, then run its bytecode.
+    bool loadCart(const char* path);
+    const char* title()  const { return title_; }
+    const char* author() const { return author_; }
     void callInit();                       // runs _init once
     void runFrame(const InputState& in);   // _update + _draw, flush, SWAP
 
@@ -40,6 +44,7 @@ public:
     void pushSprite(const OamEntry& e);
     void setCamera(int16_t x, int16_t y);
     void setLayer(uint8_t layer)   { curLayer_   = layer   < kNumBgLayers ? layer   : 0; }
+    uint8_t curLayer() const       { return curLayer_; }
     void setPalette(uint8_t sub)   { curPalette_ = sub     < kSubPalettes ? sub     : 0; }
     uint8_t curPalette() const     { return curPalette_; }
 
@@ -60,6 +65,8 @@ private:
     uint8_t  curPalette_ = 0;
 
     char err_[256] = {0};
+    char title_[33] = {0};
+    char author_[33] = {0};
 
     void registerApi();
     void callGlobal(const char* name);   // optional global; records errors

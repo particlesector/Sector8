@@ -3,6 +3,7 @@
 #include "soft_fpga.h"
 #include "font8x8_s8.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -19,7 +20,28 @@ inline uint8_t nibble(uint8_t byte, int evenPixel) {
 }
 } // namespace
 
-SoftFpga::SoftFpga() : sdram_(kSdramBytes, 0) { reset(); }
+SoftFpga::SoftFpga() : sdram_(kSdramBytes, 0) { initWavetables(); reset(); }
+
+// Preloaded classic waveforms (§3.7). One-time table fill; the per-sample synth
+// path below is pure integer/fixed-point. The FPGA bakes the same tables in ROM.
+void SoftFpga::initWavetables() {
+    constexpr double kPi = 3.14159265358979323846;   // local: only the sine fill needs it
+    const int N = kWavetableLen;
+    for (int i = 0; i < N; ++i) {
+        wavetables_[0][i] = int8_t(i < N / 2 ? 127 : -128);              // square (50%)
+        int tri = (i < N / 2) ? (-128 + i * 512 / N)                    // triangle
+                              : (127 - (i - N / 2) * 512 / N);
+        wavetables_[1][i] = int8_t(std::clamp(tri, -128, 127));
+        wavetables_[2][i] = int8_t(-128 + i * 255 / (N - 1));            // saw
+        wavetables_[3][i] = int8_t(std::lround(127.0 * std::sin(2.0 * kPi * i / N))); // sine
+    }
+    // slots 4..7 default to silence (all zero) until a custom wavetable loads.
+
+    // Semitone -> Hz (equal temperament, A4=440 at note 69). One-time; the RTL
+    // bakes the same table so the sequencer's note->freq is a pure lookup.
+    for (int n = 0; n < 128; ++n)
+        noteFreq_[n] = uint16_t(std::lround(440.0 * std::pow(2.0, (n - 69) / 12.0)));
+}
 
 // ---- per-frame state writes (into back_) ----------------------------------
 
@@ -207,6 +229,9 @@ void SoftFpga::reset() {
     ovlActive_.fill(0);
     ovlBack_.fill(0);
     resetClip();
+    for (auto& c : apu_) c = ApuChannel{};   // wavetables_ persist (set in ctor)
+    musicActive = false; musicCur = 0; musicLoopStart = 0;
+    musicCtr = 0; musicPatternSamples = 0;
     statusRegs_ = Status{};
 }
 
@@ -214,6 +239,229 @@ void SoftFpga::reset() {
 
 VideoFrame SoftFpga::frame() const {
     return VideoFrame{ fb_.data(), kScreenW, kScreenH };
+}
+
+// ---- APU: envelope + note triggering --------------------------------------
+// Map an ADSR time param (0..255) to a per-sample increment covering `span`.
+int32_t SoftFpga::envIncForTime(uint8_t param, int32_t span) {
+    const int samples = int(param) * kAudioSampleRate / 256;   // param 256 ~= 1s
+    if (samples <= 0) return span;                              // instant
+    return std::max(1, span / samples);
+}
+
+void SoftFpga::triggerNote(ApuChannel& c, uint16_t freq, uint8_t wave, uint8_t vol,
+                           int32_t attackInc, int32_t decayInc,
+                           int32_t sustainLevel, int32_t releaseInc) {
+    c.phase        = 0;
+    c.phaseInc     = uint32_t((uint64_t(freq) << 32) / kAudioSampleRate);
+    c.noise        = (wave == kWaveNoise);
+    c.waveSlot     = c.noise ? 0 : uint8_t(wave & (kWavetableSlots - 1));
+    c.volume       = vol > 15 ? 15 : vol;
+    c.attackInc    = attackInc;
+    c.decayInc     = decayInc;
+    c.sustainLevel = sustainLevel;
+    c.releaseInc   = releaseInc;
+    c.envLevel     = 0;
+    c.envPhase     = ApuChannel::Attack;
+}
+
+void SoftFpga::advanceEnv(ApuChannel& c) {
+    switch (c.envPhase) {
+        case ApuChannel::Attack:
+            c.envLevel += c.attackInc;
+            if (c.envLevel >= kEnvUnity) { c.envLevel = kEnvUnity; c.envPhase = ApuChannel::Decay; }
+            break;
+        case ApuChannel::Decay:
+            c.envLevel -= c.decayInc;
+            if (c.envLevel <= c.sustainLevel) { c.envLevel = c.sustainLevel; c.envPhase = ApuChannel::Sustain; }
+            break;
+        case ApuChannel::Sustain: break;
+        case ApuChannel::Release:
+            c.envLevel -= c.releaseInc;
+            if (c.envLevel <= 0) { c.envLevel = 0; c.envPhase = ApuChannel::Idle; }
+            break;
+        case ApuChannel::Idle: break;
+    }
+}
+
+// Low-level trigger (Part 1 `sound()`): instant on, full sustain, short release.
+void SoftFpga::audioSetChannel(uint8_t ch, uint16_t freqHz, uint8_t wave, uint8_t volume) {
+    if (ch >= kAudioChannels) return;
+    ApuChannel& c = apu_[ch];
+    c.sfxActive    = false;                       // a raw note takes the channel
+    c.phase        = 0;
+    c.phaseInc     = uint32_t((uint64_t(freqHz) << 32) / kAudioSampleRate);
+    c.noise        = (wave == kWaveNoise);
+    c.waveSlot     = c.noise ? 0 : uint8_t(wave & (kWavetableSlots - 1));
+    c.volume       = volume > 15 ? 15 : volume;
+    c.sustainLevel = kEnvUnity;
+    c.releaseInc   = kEnvUnity / 256;             // ~5 ms release
+    c.envLevel     = kEnvUnity;
+    c.envPhase     = ApuChannel::Sustain;
+}
+
+void SoftFpga::audioNoteOff(uint8_t ch) {
+    if (ch < kAudioChannels) apu_[ch].envPhase = ApuChannel::Release;
+}
+
+void SoftFpga::audioLoadWavetable(uint8_t slot, std::span<const int8_t> samples) {
+    if (slot >= kWavetableSlots) return;
+    const int n = std::min<int>(kWavetableLen, int(samples.size()));
+    for (int i = 0; i < n; ++i) wavetables_[slot][i] = samples[i];
+}
+
+// ---- APU: sequencer (instruments + SFX patterns) --------------------------
+void SoftFpga::audioSetInstrument(uint8_t id, uint8_t wave, uint8_t a, uint8_t d,
+                                  uint8_t s, uint8_t r) {
+    if (id >= kInstrumentSlots) return;
+    instruments_[id] = { wave, a, d, s, r };
+}
+
+void SoftFpga::audioSetSfx(uint8_t id, uint8_t speed, std::span<const SfxStep> steps) {
+    if (id >= kSfxSlots) return;
+    Sfx& s = sfx_[id];
+    s.speed = speed ? speed : 1;
+    const int n = std::min<int>(kSfxSteps, int(steps.size()));
+    for (int i = 0; i < kSfxSteps; ++i) s.steps[i] = (i < n) ? steps[i] : SfxStep{};
+}
+
+// Channel-stealing rule (documented, deterministic): prefer an idle channel;
+// if all are busy, steal the QUIETEST (lowest volume x envelope level), and it
+// resumes whatever it was doing only if re-triggered. Same in sim and RTL.
+int SoftFpga::pickChannel() const {
+    for (int i = 0; i < kAudioChannels; ++i)
+        if (apu_[i].envPhase == ApuChannel::Idle && !apu_[i].sfxActive) return i;
+    int best = 0; int64_t quietest = INT64_MAX;
+    for (int i = 0; i < kAudioChannels; ++i) {
+        const int64_t loud = int64_t(apu_[i].volume) * apu_[i].envLevel;
+        if (loud < quietest) { quietest = loud; best = i; }
+    }
+    return best;
+}
+
+void SoftFpga::applySfxStep(ApuChannel& c) {
+    const SfxStep& st = sfx_[c.sfxId].steps[c.sfxStep];
+    if (st.vol == 0) { c.envPhase = ApuChannel::Release; return; }   // rest
+    const Instrument& in = instruments_[st.inst & (kInstrumentSlots - 1)];
+    const int32_t sus = int32_t(in.s) * kEnvUnity / 255;
+    triggerNote(c, noteFreq_[st.note & 127], in.wave, st.vol,
+                envIncForTime(in.a, kEnvUnity),
+                envIncForTime(in.d, kEnvUnity - sus),
+                sus,
+                envIncForTime(in.r, kEnvUnity));
+}
+
+void SoftFpga::launchSfx(uint8_t id, int ch, bool musicOwned) {
+    ApuChannel& c = apu_[ch];
+    c.sfxActive      = true;
+    c.musicOwned     = musicOwned;
+    c.sfxId          = id;
+    c.sfxStep        = 0;
+    c.sfxCtr         = 0;
+    c.sfxStepSamples = uint32_t(sfx_[id].speed) * kAudioSampleRate / 120;  // 120 ticks/s
+}
+
+void SoftFpga::audioPlaySfx(uint8_t id, int channel) {
+    if (id >= kSfxSlots) return;
+    const int ch = (channel >= 0 && channel < kAudioChannels) ? channel : pickChannel();
+    launchSfx(id, ch, /*musicOwned*/false);   // a game SFX takes ownership of the channel
+}
+
+// ---- APU: music sequencer -------------------------------------------------
+void SoftFpga::audioSetMusic(uint8_t id, std::span<const uint8_t> channelSfx, uint8_t flags) {
+    if (id >= kMusicPatterns) return;
+    MusicPattern& m = music_[id];
+    for (int i = 0; i < kAudioChannels; ++i)
+        m.sfx[i] = (i < int(channelSfx.size())) ? channelSfx[i] : 0xFF;
+    m.loopStart = flags & 1; m.loopEnd = flags & 2; m.stop = flags & 4;
+}
+
+void SoftFpga::music(int track, int /*command*/) {
+    if (track < 0) {                                  // stop + release music voices
+        musicActive = false;
+        for (auto& c : apu_)
+            if (c.musicOwned) { c.sfxActive = false; c.musicOwned = false;
+                                c.envPhase = ApuChannel::Release; }
+        return;
+    }
+    if (track >= kMusicPatterns) return;
+    musicActive = true;
+    musicCur = track;
+    musicLoopStart = track;
+    musicCtr = 0;                                     // startMusicPattern fires next sample
+}
+
+// Launch every assigned SFX for the current pattern; its length is the longest
+// of them (so nothing is cut mid-phrase; channels normally share a speed).
+void SoftFpga::startMusicPattern() {
+    const MusicPattern& p = music_[musicCur];
+    if (p.loopStart) musicLoopStart = musicCur;
+    uint32_t dur = 0;
+    for (int ch = 0; ch < kAudioChannels; ++ch) {
+        if (p.sfx[ch] == 0xFF) continue;
+        launchSfx(p.sfx[ch], ch, /*musicOwned*/true);
+        const uint32_t d = uint32_t(sfx_[p.sfx[ch]].speed) * kSfxSteps
+                         * kAudioSampleRate / 120;
+        if (d > dur) dur = d;
+    }
+    if (dur == 0) dur = kSfxSteps * 8u * kAudioSampleRate / 120;   // empty pattern default
+    musicPatternSamples = dur;
+}
+
+int SoftFpga::pullAudio(int16_t* dst, int maxFrames) {
+    for (int f = 0; f < maxFrames; ++f) {
+        // Music sequencer: launch each pattern's SFX and advance/loop autonomously.
+        if (musicActive) {
+            if (musicCtr == 0) startMusicPattern();
+            if (++musicCtr >= musicPatternSamples) {
+                musicCtr = 0;
+                const MusicPattern& p = music_[musicCur];
+                if (p.stop)          musicActive = false;
+                else if (p.loopEnd)  musicCur = musicLoopStart;
+                else if (++musicCur >= kMusicPatterns) musicActive = false;
+            }
+        }
+
+        int mix = 0;
+        for (auto& c : apu_) {
+            // SFX player: apply the step's note at each step boundary.
+            if (c.sfxActive) {
+                if (c.sfxCtr == 0) applySfxStep(c);
+                if (++c.sfxCtr >= c.sfxStepSamples) {
+                    c.sfxCtr = 0;
+                    if (++c.sfxStep >= kSfxSteps) {          // pattern finished
+                        c.sfxActive = false;
+                        c.envPhase = ApuChannel::Release;
+                    }
+                }
+            }
+
+            advanceEnv(c);
+            if (c.envPhase == ApuChannel::Idle && c.envLevel == 0) continue;
+
+            c.phase += c.phaseInc;
+            const uint8_t idx = uint8_t(c.phase >> 27);       // top 5 bits -> 0..31
+            int sample;
+            if (c.noise) {
+                if (idx != c.lastIdx) {                        // clock LFSR at note rate
+                    const uint16_t bit = uint16_t((c.lfsr ^ (c.lfsr >> 1)) & 1u);
+                    c.lfsr = uint16_t((c.lfsr >> 1) | (bit << 14));
+                    c.lastIdx = idx;
+                }
+                sample = (c.lfsr & 1) ? 127 : -128;
+            } else {
+                sample = wavetables_[c.waveSlot][idx];
+            }
+            // volume (0..15) x envelope (0..kEnvUnity), fixed-point.
+            mix += int(int64_t(sample) * c.volume * c.envLevel >> 20);
+        }
+        int s = mix * 4;                                       // 4-channel headroom -> int16
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        dst[2 * f]     = int16_t(s);
+        dst[2 * f + 1] = int16_t(s);
+    }
+    return maxFrames;
 }
 
 // ---- rasterizer -----------------------------------------------------------

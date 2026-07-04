@@ -31,7 +31,24 @@ inline constexpr int kSubPalettes      = 4;     // (§3.1)
 inline constexpr int kPaletteSize      = 16;    // colors per sub-palette
 inline constexpr int kPaletteEntries   = kSubPalettes * kPaletteSize; // 64 LUT
 inline constexpr int kNumBgLayers      = 2;     // BG0, BG1 — committed baseline
+inline constexpr int kBgMapW           = 64;    // tilemap cells per row (per layer)
+inline constexpr int kBgMapH           = 64;
 inline constexpr int kAudioChannels    = 4;     // (§3.7)
+inline constexpr int kWavetableSlots   = 8;     // 0..3 preloaded, 4..7 custom
+inline constexpr int kWavetableLen     = 32;    // samples per wavetable (§3.7)
+inline constexpr int kWaveNoise        = 8;     // sentinel: LFSR noise, not a slot
+inline constexpr int kAudioSampleRate  = 48000; // matches the HDMI/SDL stream
+inline constexpr int kInstrumentSlots  = 32;    // instrument definitions
+inline constexpr int kSfxSlots         = 64;    // sound-effect patterns
+inline constexpr int kMusicPatterns    = 64;    // song patterns (chains of SFX)
+inline constexpr int kSfxSteps         = 32;    // steps per SFX pattern (§3.7)
+
+// One step of an SFX pattern. vol == 0 means "rest" (release the channel).
+struct SfxStep {
+    uint8_t note = 0;   // semitone number (60 = C4)
+    uint8_t inst = 0;   // instrument id
+    uint8_t vol  = 0;   // 0..15; 0 = rest
+};
 
 // ---- Color: 12-bit RGB, 4 bits/channel (§3.1) -----------------------------
 struct Color12 {

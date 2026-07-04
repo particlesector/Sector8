@@ -24,6 +24,8 @@ find_package(SDL3 REQUIRED CONFIG)
 
 set(S8_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/app
+    ${CMAKE_CURRENT_SOURCE_DIR}/cart
     ${CMAKE_CURRENT_SOURCE_DIR}/fpga
     ${CMAKE_CURRENT_SOURCE_DIR}/host
     ${CMAKE_CURRENT_SOURCE_DIR}/mcu)
@@ -85,3 +87,42 @@ target_link_libraries(s8_overlay_test PRIVATE s8_fpga)
 add_executable(s8_bg1_test bg1_test.cpp)
 target_include_directories(s8_bg1_test PRIVATE ${S8_INCLUDE_DIRS})
 target_link_libraries(s8_bg1_test PRIVATE s8_fpga)
+
+# Headless APU test (no SDL) — writes apu_test.wav.
+add_executable(s8_apu_test apu_test.cpp)
+target_include_directories(s8_apu_test PRIVATE ${S8_INCLUDE_DIRS})
+target_link_libraries(s8_apu_test PRIVATE s8_fpga)
+
+# Headless Part 2a test (no SDL) — writes sfx_test.wav.
+add_executable(s8_sfx_test sfx_test.cpp)
+target_include_directories(s8_sfx_test PRIVATE ${S8_INCLUDE_DIRS})
+target_link_libraries(s8_sfx_test PRIVATE s8_fpga)
+
+# Headless Part 2b test (no SDL) — writes music_test.wav.
+add_executable(s8_music_test music_test.cpp)
+target_include_directories(s8_music_test PRIVATE ${S8_INCLUDE_DIRS})
+target_link_libraries(s8_music_test PRIVATE s8_fpga)
+
+# --- cart toolchain ---------------------------------------------------------
+set(S8_TOOL_INCLUDES ${S8_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+# stb_image ships a couple of unused-static helpers; silence just for its TU.
+set_source_files_properties(tools/png_import.cpp PROPERTIES COMPILE_OPTIONS
+    "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wno-unused-function>")
+
+# The packer: compiles .lua -> bytecode and imports a PNG spritesheet.
+add_executable(s8pack tools/s8pack.cpp tools/png_import.cpp)
+target_include_directories(s8pack PRIVATE ${S8_TOOL_INCLUDES})
+target_link_libraries(s8pack PRIVATE lua_s8)
+s8_pin_luaconf(s8pack)
+
+# Headless importer unit test (no SDL, no Lua).
+add_executable(s8_png_test png_import_test.cpp tools/png_import.cpp)
+target_include_directories(s8_png_test PRIVATE ${S8_TOOL_INCLUDES})
+
+# Headless PNG-cart end-to-end test (loads example.s8; run s8pack first).
+add_executable(s8_cart_test cart_test.cpp)
+target_include_directories(s8_cart_test PRIVATE ${S8_INCLUDE_DIRS})
+target_link_libraries(s8_cart_test PRIVATE s8_mcu)

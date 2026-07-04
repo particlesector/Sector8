@@ -20,6 +20,9 @@ function _update()
   if py < 0 then py = 0 elseif py > 172 then py = 172 end
   scroll = scroll + (button(A) and 3 or 1)
   frames = frames + 1
+
+  if button_pressed(X) then sound(0, 440, NOISE, 12) end
+  if not button(X)     then sound_off(0) end
 end
 
 function _draw()

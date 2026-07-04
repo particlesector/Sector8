@@ -73,10 +73,32 @@ public:
     virtual void ovlBlit(int x, int y, int w, int h,
                          std::span<const uint8_t> packed) = 0;
 
-    // -- Audio (FPGA sequencer runs autonomously; §3.7) ----------------------
-    // Representative — params will firm up with the APU register map.
-    virtual void sound(int id, int channel = -1) = 0;
-    virtual void music(int track, int command = 0) = 0;
+    // -- Audio / APU (§3.7): 4-channel wavetable DDS ------------------------
+    // Play/retrigger a channel: `wave` 0..7 selects a wavetable slot (0..3 are
+    // the preloaded classics), `wave` == 8 selects LFSR noise. volume 0..15.
+    virtual void audioSetChannel(uint8_t ch, uint16_t freqHz,
+                                 uint8_t wave, uint8_t volume) = 0;
+    // Gate off: begin the release ramp to silence.
+    virtual void audioNoteOff(uint8_t ch) = 0;
+    // Load a custom 32-sample wavetable (int8) into a slot.
+    virtual void audioLoadWavetable(uint8_t slot, std::span<const int8_t> samples) = 0;
+
+    // -- Sequencer (§3.7): instruments, SFX patterns ------------------------
+    // Instrument = a wavetable slot (or noise) + a 4-byte ADSR envelope.
+    virtual void audioSetInstrument(uint8_t id, uint8_t wave,
+                                    uint8_t a, uint8_t d, uint8_t s, uint8_t r) = 0;
+    // Define an SFX: `speed` ticks per step, then up to 32 steps.
+    virtual void audioSetSfx(uint8_t id, uint8_t speed, std::span<const SfxStep> steps) = 0;
+    // Play SFX `id`; channel < 0 = auto-pick (steal the quietest if all busy).
+    virtual void audioPlaySfx(uint8_t id, int channel) = 0;
+
+    // -- Music sequencer (§3.7): chains of SFX across the 4 channels ---------
+    // Define a music pattern: an SFX id per channel (0xFF = none) + flags
+    // (bit0 loop-start, bit1 loop-end, bit2 stop).
+    virtual void audioSetMusic(uint8_t id, std::span<const uint8_t> channelSfx,
+                               uint8_t flags) = 0;
+    // Start playing at pattern `track` (auto-advances/loops); track < 0 = stop.
+    virtual void music(int track, int command) = 0;
 
     // -- Asset loads (bursty; paced by READY on real transport, §A.4) --------
     virtual void loadBegin(uint32_t destAddr, uint32_t length) = 0;

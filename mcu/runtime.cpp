@@ -1,9 +1,12 @@
 // mcu/runtime.cpp  — Sector8 MCU runtime + Lua API bindings.
 
 #include "runtime.h"
+#include "cart.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 extern "C" {
 #include "lua.h"
@@ -48,6 +51,20 @@ static int l_sprite(lua_State* L) {
 static int l_camera(lua_State* L) {
     self(L)->setCamera(int16_t(luaL_optinteger(L, 1, 0)),
                        int16_t(luaL_optinteger(L, 2, 0)));
+    return 0;
+}
+
+// set_tile(cx, cy, tile, [palette], [flags])  -> writes one cell of the active layer.
+static int l_set_tile(lua_State* L) {
+    const int cx = int(luaL_checkinteger(L, 1));
+    const int cy = int(luaL_checkinteger(L, 2));
+    if (cx < 0 || cx >= kBgMapW || cy < 0 || cy >= kBgMapH) return 0;
+    const int flip = int(luaL_optinteger(L, 5, 0));
+    TileCell c{ uint16_t(luaL_checkinteger(L, 3)), uint8_t(luaL_optinteger(L, 4, 0)),
+               bool(flip & 1), bool(flip & 2), bool(flip & 4) };
+    Runtime* rt = self(L);
+    rt->fpga().writeTilemap(rt->curLayer(), uint16_t(cy * kBgMapW + cx),
+                            std::span<const TileCell>(&c, 1));
     return 0;
 }
 
@@ -147,10 +164,119 @@ static int l_blit(lua_State* L) {
     return 0;
 }
 
+// ---- audio bindings --------------------------------------------------------
+// sound(channel, freq_hz, waveform, volume)  waveform: 0..7 slot, 8 = noise.
+static int l_sound(lua_State* L) {
+    self(L)->fpga().audioSetChannel(uint8_t(luaL_checkinteger(L,1)),
+                                    uint16_t(luaL_checkinteger(L,2)),
+                                    uint8_t(luaL_checkinteger(L,3)),
+                                    uint8_t(luaL_checkinteger(L,4)));
+    return 0;
+}
+static int l_sound_off(lua_State* L) {
+    self(L)->fpga().audioNoteOff(uint8_t(luaL_checkinteger(L,1)));
+    return 0;
+}
+// set_wavetable(slot, {32 samples in -128..127})
+static int l_set_wavetable(lua_State* L) {
+    const int slot = int(luaL_checkinteger(L,1));
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int8_t buf[kWavetableLen];
+    for (int i = 0; i < kWavetableLen; ++i) {
+        lua_geti(L, 2, i + 1);
+        buf[i] = int8_t(std::clamp(int(luaL_optinteger(L, -1, 0)), -128, 127));
+        lua_pop(L, 1);
+    }
+    self(L)->fpga().audioLoadWavetable(uint8_t(slot),
+        std::span<const int8_t>(buf, kWavetableLen));
+    return 0;
+}
+static int l_music(lua_State* L) {   // Part 2b: sequencer
+    self(L)->fpga().music(int(luaL_checkinteger(L,1)), int(luaL_optinteger(L,2,0)));
+    return 0;
+}
+
+// set_instrument(id, {wave=SINE, a=, d=, s=, r=})
+static int l_set_instrument(lua_State* L) {
+    const int id = int(luaL_checkinteger(L,1));
+    luaL_checktype(L, 2, LUA_TTABLE);
+    auto field = [&](const char* k, int def) {
+        lua_getfield(L, 2, k);
+        int v = int(luaL_optinteger(L, -1, def));
+        lua_pop(L, 1); return v;
+    };
+    self(L)->fpga().audioSetInstrument(uint8_t(id),
+        uint8_t(field("wave",0)), uint8_t(field("a",0)), uint8_t(field("d",0)),
+        uint8_t(field("s",255)),  uint8_t(field("r",0)));
+    return 0;
+}
+
+// set_sfx(id, {speed=8, notes={ {note=,inst=,vol=}, ... }})
+static int l_set_sfx(lua_State* L) {
+    const int id = int(luaL_checkinteger(L,1));
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_getfield(L, 2, "speed");
+    const int speed = int(luaL_optinteger(L, -1, 8));
+    lua_pop(L, 1);
+
+    SfxStep steps[kSfxSteps] = {};
+    lua_getfield(L, 2, "notes");
+    if (lua_istable(L, -1)) {
+        for (int i = 0; i < kSfxSteps; ++i) {
+            lua_geti(L, -1, i + 1);              // notes[i+1]
+            if (lua_istable(L, -1)) {
+                auto f = [&](const char* k, int def) {
+                    lua_getfield(L, -1, k);
+                    int v = int(luaL_optinteger(L, -1, def));
+                    lua_pop(L, 1); return v;
+                };
+                steps[i] = { uint8_t(f("note",0)), uint8_t(f("inst",0)), uint8_t(f("vol",0)) };
+            }
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    self(L)->fpga().audioSetSfx(uint8_t(id), uint8_t(speed),
+        std::span<const SfxStep>(steps, kSfxSteps));
+    return 0;
+}
+
+// sfx(id, [channel])  -- channel omitted = auto-pick (steal quietest if busy)
+// set_music(id, {sfx={0,1,2,-1}, loop_start=, loop_end=, stop=})
+static int l_set_music(lua_State* L) {
+    const int id = int(luaL_checkinteger(L,1));
+    luaL_checktype(L, 2, LUA_TTABLE);
+    uint8_t sfx[kAudioChannels] = {0xFF, 0xFF, 0xFF, 0xFF};
+    lua_getfield(L, 2, "sfx");
+    if (lua_istable(L, -1)) {
+        for (int i = 0; i < kAudioChannels; ++i) {
+            lua_geti(L, -1, i + 1);
+            int v = int(luaL_optinteger(L, -1, -1));
+            sfx[i] = (v < 0) ? 0xFF : uint8_t(v);
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    auto flag = [&](const char* k) {
+        lua_getfield(L, 2, k); bool b = lua_toboolean(L, -1); lua_pop(L, 1); return b;
+    };
+    const uint8_t flags = uint8_t((flag("loop_start")?1:0) | (flag("loop_end")?2:0)
+                                | (flag("stop")?4:0));
+    self(L)->fpga().audioSetMusic(uint8_t(id), std::span<const uint8_t>(sfx, kAudioChannels), flags);
+    return 0;
+}
+
+static int l_play_sfx(lua_State* L) {
+    self(L)->fpga().audioPlaySfx(uint8_t(luaL_checkinteger(L,1)),
+                                 int(luaL_optinteger(L,2,-1)));
+    return 0;
+}
+
 void Runtime::registerApi() {
     const luaL_Reg api[] = {
         {"sprite", l_sprite}, {"spr", l_sprite},
         {"camera", l_camera},
+        {"set_tile", l_set_tile}, {"mset", l_set_tile},
         {"layer",  l_layer},
         {"use_palette", l_use_palette},
         {"button", l_button}, {"btn", l_button},
@@ -163,6 +289,14 @@ void Runtime::registerApi() {
         {"text", l_text}, {"print", l_text},
         {"overlay_mode", l_overlay_mode}, {"overlay_palette", l_overlay_palette},
         {"clip", l_clip}, {"blit", l_blit},
+        {"sound", l_sound},
+        {"sound_off", l_sound_off},
+        {"set_wavetable", l_set_wavetable},
+        {"set_instrument", l_set_instrument},
+        {"set_sfx", l_set_sfx},
+        {"set_music", l_set_music},
+        {"sfx", l_play_sfx},
+        {"music", l_music},
         {nullptr, nullptr},
     };
     for (const luaL_Reg* r = api; r->name; ++r) {
@@ -175,6 +309,12 @@ void Runtime::registerApi() {
         lua_pushinteger(L_, i);
         lua_setglobal(L_, names[i]);
     }
+    // Waveform constants.
+    const char* waves[] = {"SQUARE","TRIANGLE","SAW","SINE"};
+    for (int i = 0; i < 4; ++i) { lua_pushinteger(L_, i); lua_setglobal(L_, waves[i]); }
+    lua_pushinteger(L_, kWaveNoise); lua_setglobal(L_, "NOISE");
+    lua_pushinteger(L_, kBgMapW); lua_setglobal(L_, "MAP_W");
+    lua_pushinteger(L_, kBgMapH); lua_setglobal(L_, "MAP_H");
 }
 
 // ---- lifecycle -------------------------------------------------------------
@@ -207,6 +347,67 @@ void Runtime::setError(const char* ctx) {
 bool Runtime::loadCartSource(const char* path) {
     if (luaL_loadfilex(L_, path, nullptr) != LUA_OK) { setError("load"); return false; }
     if (lua_pcall(L_, 0, 0, 0) != LUA_OK)            { setError("run");  return false; }
+    return true;
+}
+
+bool Runtime::loadCart(const char* path) {
+    // read the whole file
+    FILE* fp = std::fopen(path, "rb");
+    if (!fp) { std::snprintf(err_, sizeof err_, "cart: cannot open %s", path); return false; }
+    std::fseek(fp, 0, SEEK_END); long n = std::ftell(fp); std::fseek(fp, 0, SEEK_SET);
+    std::vector<uint8_t> buf(size_t(n < 0 ? 0 : n));
+    if (!buf.empty() && std::fread(buf.data(), 1, buf.size(), fp) != buf.size()) {
+        std::fclose(fp); std::snprintf(err_, sizeof err_, "cart: short read"); return false;
+    }
+    std::fclose(fp);
+
+    CartView cart = parseCart(buf.data(), buf.size());
+    if (!cart.valid) { std::snprintf(err_, sizeof err_, "cart: bad magic/version"); return false; }
+
+    const uint8_t* p; uint32_t len;
+
+    // META: title[32], author[32]
+    if (cart.section(CartSection::Meta, p, len) && len >= 64) {
+        std::memcpy(title_,  p,      32); title_[32] = 0;
+        std::memcpy(author_, p + 32, 32); author_[32] = 0;
+    }
+    // PALETTE: repeated (index u8, r u8, g u8, b u8)
+    if (cart.section(CartSection::Palette, p, len)) {
+        for (uint32_t i = 0; i + 4 <= len; i += 4) {
+            Color12 c{ uint8_t(p[i+1] & 15), uint8_t(p[i+2] & 15), uint8_t(p[i+3] & 15) };
+            dev_.setPalette(p[i], std::span<const Color12>(&c, 1));
+        }
+    }
+    // TILES: raw 4bpp tile-bank bytes -> SDRAM bank 0
+    if (cart.section(CartSection::Tiles, p, len)) {
+        dev_.loadBegin(0, len);
+        dev_.loadData(std::span<const uint8_t>(p, len));
+        dev_.loadEnd(0);
+        dev_.bankActivate(0);
+    }
+    // MAP0 / MAP1: packed 16-bit cells (see cart.h packCell)
+    auto loadMap = [&](CartSection sec, uint8_t layer) {
+        const uint8_t* mp; uint32_t ml;
+        if (!cart.section(sec, mp, ml)) return;
+        std::vector<TileCell> cells(ml / 2);
+        for (size_t i = 0; i < cells.size(); ++i) {
+            uint16_t v = rd16(mp + i * 2);
+            cells[i] = { uint16_t(v & 0x3FF), uint8_t((v >> 10) & 3),
+                         bool((v >> 12) & 1), bool((v >> 13) & 1), bool((v >> 14) & 1) };
+        }
+        dev_.writeTilemap(layer, 0, cells);
+    };
+    loadMap(CartSection::Map0, 0);
+    loadMap(CartSection::Map1, 1);
+
+    // BYTECODE: undump and run the chunk
+    if (!cart.section(CartSection::Bytecode, p, len)) {
+        std::snprintf(err_, sizeof err_, "cart: no bytecode section"); return false;
+    }
+    if (luaL_loadbufferx(L_, reinterpret_cast<const char*>(p), len, "@cart", "b") != LUA_OK) {
+        setError("cart bytecode"); return false;
+    }
+    if (lua_pcall(L_, 0, 0, 0) != LUA_OK) { setError("cart run"); return false; }
     return true;
 }
 
